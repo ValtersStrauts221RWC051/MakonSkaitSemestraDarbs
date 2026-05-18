@@ -1,0 +1,54 @@
+services:
+  mattermost:
+    image: mattermost/mattermost-preview:latest
+    platform: linux/amd64
+    container_name: dns-security-mattermost
+    ports:
+      - "8065:8065"
+    environment:
+      MM_SERVICESETTINGS_SITEURL: "http://localhost:8065"
+      MM_SERVICESETTINGS_ENABLEBOTACCOUNTCREATION: "true"
+      MM_SERVICESETTINGS_ENABLEUSERACCESSTOKENS: "true"
+      MM_TEAMSETTINGS_ENABLEOPENSERVER: "true"
+      MM_TEAMSETTINGS_ENABLEUSERCREATION: "true"
+    volumes:
+      - mattermost-data:/mm/mattermost-data
+
+  mattermost-bootstrap:
+    build: .
+    container_name: dns-security-mattermost-bootstrap
+    depends_on:
+      - mattermost
+    environment:
+      MATTERMOST_BOOTSTRAP_URL: "http://mattermost:8065"
+      MATTERMOST_PUBLIC_URL: "http://localhost:8065"
+      MATTERMOST_ADMIN_EMAIL: "admin@example.com"
+      MATTERMOST_ADMIN_USERNAME: "admin"
+      MATTERMOST_ADMIN_PASSWORD: "Password123!"
+      MATTERMOST_TEST_USER_EMAIL: "user@example.com"
+      MATTERMOST_TEST_USER_USERNAME: "test-user"
+      MATTERMOST_TEST_USER_PASSWORD: "Password123!"
+      MATTERMOST_TEAM_NAME: "dns-security"
+      MATTERMOST_CHANNEL_NAME: "dns-security-alerts"
+      MATTERMOST_BOT_USERNAME: "dns-security-bot"
+      MATTERMOST_RUNTIME_ENV: "/runtime/mattermost.env"
+    volumes:
+      - ./.runtime:/runtime
+    command: ["python", "scripts/bootstrap_mattermost.py"]
+
+  api:
+    build: .
+    container_name: dns-security-api
+    depends_on:
+      mattermost-bootstrap:
+        condition: service_completed_successfully
+    ports:
+      - "8000:8000"
+    environment:
+      MODEL_THRESHOLD: "0.0"
+    volumes:
+      - ./.runtime:/runtime
+    command: ["./scripts/run_api.sh"]
+
+volumes:
+  mattermost-data:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html
+import logging
 import os
 import random
 import re
@@ -659,12 +660,8 @@ def create_app(
         logger.debug("Computed features for %s: %s", analysis.query_name, features)
 
         model_is_onnx = getattr(model, "__onnx__", False)
-        if store.is_blocked(analysis.query_name):
-            logger.info("Query %s is blocklisted, forcing score=1.0", analysis.query_name)
-            score = 1.0
-        else:
-            logger.debug("Scoring with model (onnx=%s) for %s", model_is_onnx, analysis.query_name)
-            score = min(1.0, max(0.0, float(model(analysis))))
+        logger.debug("Scoring with model (onnx=%s) for %s", model_is_onnx, analysis.query_name)
+        score = min(1.0, max(0.0, float(model(analysis))))
 
         alerted = score >= config.threshold
         notification_sent = notify(config, analysis, score) if alerted else False

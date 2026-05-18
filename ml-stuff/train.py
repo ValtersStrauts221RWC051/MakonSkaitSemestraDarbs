@@ -21,18 +21,6 @@ from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
 FEATURES_KEEP = [
-    "duration",
-    "total_bytes",
-    "receiving_bytes",
-    "sending_bytes",
-    "packets_rate",
-    "packets_len_rate",
-    "min_packets_len",
-    "max_packets_len",
-    "mean_packets_len",
-    "standard_deviation_packets_len",
-    "variance_packets_len",
-    "coefficient_of_variation_packets_len",
     "dns_domain_name_length",
     "dns_subdomain_name_length",
     "numerical_percentage",
@@ -43,35 +31,42 @@ FEATURES_KEEP = [
     "max_continuous_same_alphabet_len",
     "vowels_consonant_ratio",
     "conv_freq_vowels_consonants",
-    "distinct_ttl_values",
-    "ttl_values_min",
-    "ttl_values_max",
-    "ttl_values_mean",
-    "ttl_values_mode",
-    "ttl_values_median",
-    "distinct_A_records",
 ]
 
 LABEL_COL = "label"
 
 
-def load_dataset(csv_list_path: Path) -> pd.DataFrame:
+def load_and_split_dataset(
+    csv_list_path: Path, seed: int, val_frac: float = 0.15, test_frac: float = 0.15
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Split each CSV individually into train/val/test, then concat the splits.
+
+    Ensures every source (benign + each tunneling tool) is proportionally
+    represented in train, val, and test.
+    """
     paths = [Path(p) for p in csv_list_path.read_text().splitlines() if p.strip()]
-    frames = []
+    tr_parts, va_parts, te_parts = [], [], []
     for p in paths:
         df = pd.read_csv(p, usecols=FEATURES_KEEP + [LABEL_COL], low_memory=False)
-        frames.append(df)
-        print(f"  loaded {p.parent.name}/{p.name}: {len(df):>8} rows")
-    full = pd.concat(frames, ignore_index=True)
-    full[LABEL_COL] = (full[LABEL_COL].str.lower() == "malicious").astype(np.int64)
-    for col in FEATURES_KEEP:
-        full[col] = pd.to_numeric(full[col], errors="coerce")
-    before = len(full)
-    full = full.dropna(subset=FEATURES_KEEP).reset_index(drop=True)
-    dropped = before - len(full)
-    if dropped:
-        print(f"  dropped {dropped} rows with NaN in numeric features")
-    return full
+        df[LABEL_COL] = (df[LABEL_COL].str.lower() == "malicious").astype(np.int64)
+        for col in FEATURES_KEEP:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        before = len(df)
+        df = df.dropna(subset=FEATURES_KEEP).reset_index(drop=True)
+
+        tr, tmp = train_test_split(df, test_size=val_frac + test_frac, random_state=seed)
+        va, te = train_test_split(tmp, test_size=test_frac / (val_frac + test_frac), random_state=seed)
+        tr_parts.append(tr)
+        va_parts.append(va)
+        te_parts.append(te)
+        suffix = f" (dropped {before - len(df)} NaN)" if before - len(df) else ""
+        print(f"  {p.parent.name}/{p.name}: train={len(tr)} val={len(va)} test={len(te)}{suffix}")
+
+    return (
+        pd.concat(tr_parts, ignore_index=True),
+        pd.concat(va_parts, ignore_index=True),
+        pd.concat(te_parts, ignore_index=True),
+    )
 
 
 def balance_undersample(df: pd.DataFrame, seed: int) -> pd.DataFrame:
@@ -84,20 +79,27 @@ def balance_undersample(df: pd.DataFrame, seed: int) -> pd.DataFrame:
 
 
 class MLP(nn.Module):
-    def __init__(self, in_dim: int, hidden: int = 128, dropout: float = 0.3):
+    def __init__(self, input_dim: int, num_classes: int = 2):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(in_dim, hidden),
+        self.model = nn.Sequential(
+            nn.Linear(input_dim, 128),
+            nn.BatchNorm1d(128),
             nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden, hidden // 2),
+            nn.Dropout(0.3),
+
+            nn.Linear(128, 64),
+            nn.BatchNorm1d(64),
             nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden // 2, 1),
+            nn.Dropout(0.2),
+
+            nn.Linear(64, 32),
+            nn.ReLU(),
+
+            nn.Linear(32, num_classes),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x).squeeze(-1)
+        return self.model(x)
 
 
 def pick_device() -> torch.device:
@@ -109,9 +111,9 @@ def pick_device() -> torch.device:
     return device
 
 
-def make_loader(x: np.ndarray, y: np.ndarray, batch: int, shuffle: bool) -> DataLoader:
-    ds = TensorDataset(torch.from_numpy(x).float(), torch.from_numpy(y).float())
-    return DataLoader(ds, batch_size=batch, shuffle=shuffle, num_workers=0, pin_memory=True)
+def make_loader(x: np.ndarray, y: np.ndarray, batch: int, shuffle: bool, drop_last: bool = False) -> DataLoader:
+    ds = TensorDataset(torch.from_numpy(x).float(), torch.from_numpy(y).long())
+    return DataLoader(ds, batch_size=batch, shuffle=shuffle, num_workers=0, pin_memory=True, drop_last=drop_last)
 
 
 @torch.no_grad()
@@ -122,19 +124,17 @@ def evaluate(model: nn.Module, loader: DataLoader, device: torch.device) -> dict
         xb = xb.to(device, non_blocking=True)
         logits_all.append(model(xb).cpu())
         y_all.append(yb)
-    logits = torch.cat(logits_all).numpy()
+    logits = torch.cat(logits_all)
     y_true = torch.cat(y_all).numpy().astype(int)
-    probs = 1.0 / (1.0 + np.exp(-logits))
-    y_pred = (probs >= 0.5).astype(int)
+    probs = torch.softmax(logits, dim=1).numpy()
+    y_pred = probs.argmax(axis=1)
     return {
-        "loss": float(nn.functional.binary_cross_entropy_with_logits(
-            torch.from_numpy(logits), torch.from_numpy(y_true.astype(np.float32))
-        )),
+        "loss": float(nn.functional.cross_entropy(logits, torch.from_numpy(y_true).long())),
         "acc": accuracy_score(y_true, y_pred),
         "precision": precision_score(y_true, y_pred, zero_division=0),
         "recall": recall_score(y_true, y_pred, zero_division=0),
         "f1": f1_score(y_true, y_pred, zero_division=0),
-        "auc": roc_auc_score(y_true, probs),
+        "auc": roc_auc_score(y_true, probs[:, 1]),
     }
 
 
@@ -143,21 +143,22 @@ def train(args: argparse.Namespace) -> None:
     np.random.seed(args.seed)
 
     print(f"loading dataset list from {args.csv_list}")
-    df = load_dataset(Path(args.csv_list))
-    print(f"total rows: {len(df)}  | benign: {(df[LABEL_COL]==0).sum()}  malicious: {(df[LABEL_COL]==1).sum()}")
+    train_df, val_df, test_df = load_and_split_dataset(Path(args.csv_list), seed=args.seed)
 
-    df = balance_undersample(df, seed=args.seed)
-    print(f"after undersample: {len(df)} rows (50/50)")
+    for name, d in (("train", train_df), ("val", val_df), ("test", test_df)):
+        print(f"  {name}: {len(d)} (benign={(d[LABEL_COL]==0).sum()} malicious={(d[LABEL_COL]==1).sum()})")
 
-    x = df[FEATURES_KEEP].to_numpy(dtype=np.float32)
-    y = df[LABEL_COL].to_numpy(dtype=np.int64)
+    train_df = balance_undersample(train_df, seed=args.seed)
+    val_df = balance_undersample(val_df, seed=args.seed)
+    test_df = balance_undersample(test_df, seed=args.seed)
+    print(f"after undersample: train={len(train_df)} val={len(val_df)} test={len(test_df)} (50/50 each)")
 
-    x_tr, x_tmp, y_tr, y_tmp = train_test_split(
-        x, y, test_size=0.30, stratify=y, random_state=args.seed
-    )
-    x_val, x_te, y_val, y_te = train_test_split(
-        x_tmp, y_tmp, test_size=0.50, stratify=y_tmp, random_state=args.seed
-    )
+    x_tr = train_df[FEATURES_KEEP].to_numpy(dtype=np.float32)
+    y_tr = train_df[LABEL_COL].to_numpy(dtype=np.int64)
+    x_val = val_df[FEATURES_KEEP].to_numpy(dtype=np.float32)
+    y_val = val_df[LABEL_COL].to_numpy(dtype=np.int64)
+    x_te = test_df[FEATURES_KEEP].to_numpy(dtype=np.float32)
+    y_te = test_df[LABEL_COL].to_numpy(dtype=np.int64)
 
     scaler = StandardScaler().fit(x_tr)
     x_tr = scaler.transform(x_tr).astype(np.float32)
@@ -165,13 +166,13 @@ def train(args: argparse.Namespace) -> None:
     x_te = scaler.transform(x_te).astype(np.float32)
 
     device = pick_device()
-    model = MLP(in_dim=len(FEATURES_KEEP), hidden=args.hidden, dropout=args.dropout).to(device)
+    model = MLP(input_dim=len(FEATURES_KEEP), num_classes=2).to(device)
     opt = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-5)
-    loss_fn = nn.BCEWithLogitsLoss()
+    loss_fn = nn.CrossEntropyLoss()
 
-    tr_loader = make_loader(x_tr, y_tr.astype(np.float32), args.batch, shuffle=True)
-    val_loader = make_loader(x_val, y_val.astype(np.float32), args.batch, shuffle=False)
-    te_loader = make_loader(x_te, y_te.astype(np.float32), args.batch, shuffle=False)
+    tr_loader = make_loader(x_tr, y_tr, args.batch, shuffle=True, drop_last=True)
+    val_loader = make_loader(x_val, y_val, args.batch, shuffle=False)
+    te_loader = make_loader(x_te, y_te, args.batch, shuffle=False)
 
     best_val = float("inf")
     best_state = None
@@ -236,8 +237,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--epochs", type=int, default=30)
     p.add_argument("--batch", type=int, default=512)
     p.add_argument("--lr", type=float, default=1e-3)
-    p.add_argument("--hidden", type=int, default=128)
-    p.add_argument("--dropout", type=float, default=0.3)
     p.add_argument("--patience", type=int, default=4, help="early-stopping patience on val loss")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--save", default="model.pt", help="path to save best model; empty to skip")

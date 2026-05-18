@@ -5,3 +5,7 @@ __pycache__/
 .runtime/
 **/venv/
 config.toml
+
+*.txt
+!requirements.txt
+!ml-stuff/requirements.txt

@@ -97,6 +97,17 @@ services:
     command: ["python", "scripts/forward_dns_logs.py"]
     restart: unless-stopped
 
+  frontend:
+    build:
+      context: ./frontend
+    container_name: dns-security-frontend
+    depends_on:
+      api:
+        condition: service_started
+    ports:
+      - "127.0.0.1:3000:80"
+    restart: unless-stopped
+
 volumes:
   postgres-data:
   mattermost-data:

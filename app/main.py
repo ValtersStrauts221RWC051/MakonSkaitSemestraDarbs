@@ -10,14 +10,15 @@ from pathlib import Path
 from typing import Callable
 
 import requests
-from fastapi import FastAPI, HTTPException, Response
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import case, func
 
 from app.database import Base, make_engine, make_session_factory
-from app.features import FEATURE_NAMES, compute_features
-from app.models import Analysis, Blocklist
+from app.features import FEATURE_NAMES, compute_features, parent_domain, subdomain_depth
+from app.models import Analysis
 
 
 @dataclass(frozen=True)
@@ -31,11 +32,19 @@ class Config:
 
 class AnalysisIn(BaseModel):
     client_ip: str = Field(..., examples=["10.50.0.102"])
+    client_port: int = Field(default=0, examples=[58954])
+    proto: str = Field(default="udp", examples=["udp"])
     query_type: str = Field(..., examples=["A"])
     query_name: str = Field(..., examples=["wikipedia.org."])
+    query_class: str = Field(default="IN", examples=["IN"])
     rcode: str = Field(default="NOERROR", examples=["NOERROR"])
     response_size: int = Field(default=0, examples=[54])
     duration_ms: float = Field(default=0.0, examples=[38.5])
+    dns_id: str = Field(default="", examples=["12345"])
+    opcode: str = Field(default="", examples=["QUERY"])
+    bufsize: str = Field(default="", examples=["1232"])
+    do_flag: str = Field(default="", examples=["false"])
+    raw_log: dict = Field(default_factory=dict)
 
 
 class AnalysisOut(BaseModel):
@@ -44,18 +53,6 @@ class AnalysisOut(BaseModel):
     threshold: float
     safe: bool
     notification_sent: bool
-
-
-class BlocklistIn(BaseModel):
-    query_name: str = Field(..., examples=["evil.example."])
-    reason: str = Field(default="", examples=["Confirmed C2 endpoint"])
-
-
-class BlocklistOut(BaseModel):
-    id: int
-    query_name: str
-    added_at: str
-    reason: str
 
 
 def load_config(path: str = "config.toml") -> Config:
@@ -87,11 +84,21 @@ def _record_dict(record: Analysis | dict) -> dict:
         "id": record.id,
         "created_at": record.created_at.isoformat(timespec="seconds"),
         "client_ip": record.client_ip,
+        "client_port": record.client_port,
+        "proto": record.proto,
         "query_type": record.query_type,
         "query_name": record.query_name,
+        "query_class": record.query_class,
+        "parent_domain": record.parent_domain,
+        "subdomain_depth": record.subdomain_depth,
         "rcode": record.rcode,
         "response_size": record.response_size,
         "duration_ms": record.duration_ms,
+        "dns_id": record.dns_id,
+        "opcode": record.opcode,
+        "bufsize": record.bufsize,
+        "do_flag": record.do_flag,
+        "raw_log": record.raw_log or {},
         "score": record.score,
         "threshold": record.threshold,
         "alerted": record.alerted,
@@ -104,7 +111,6 @@ def _record_dict(record: Analysis | dict) -> dict:
 class Store:
     def __init__(self) -> None:
         self.records: list[dict] = []
-        self._blocklist: list[dict] = []
 
     def add(
         self,
@@ -118,11 +124,21 @@ class Store:
             "id": len(self.records) + 1,
             "created_at": datetime.now(UTC).isoformat(timespec="seconds"),
             "client_ip": data.client_ip,
+            "client_port": data.client_port,
+            "proto": data.proto,
             "query_type": data.query_type,
             "query_name": data.query_name,
+            "query_class": data.query_class,
+            "parent_domain": parent_domain(data.query_name),
+            "subdomain_depth": subdomain_depth(data.query_name),
             "rcode": data.rcode,
             "response_size": data.response_size,
             "duration_ms": data.duration_ms,
+            "dns_id": data.dns_id,
+            "opcode": data.opcode,
+            "bufsize": data.bufsize,
+            "do_flag": data.do_flag,
+            "raw_log": data.raw_log,
             "score": score,
             "threshold": threshold,
             "alerted": alerted,
@@ -136,6 +152,34 @@ class Store:
     def recent(self, limit: int = 50) -> list[dict]:
         return list(reversed(self.records[-limit:]))
 
+    def query(
+        self,
+        limit: int = 50,
+        offset: int = 0,
+        query_type: str | None = None,
+        alerted: bool | None = None,
+        q: str | None = None,
+    ) -> dict:
+        rows = list(reversed(self.records))
+        if query_type:
+            rows = [r for r in rows if r["query_type"] == query_type]
+        if alerted is not None:
+            rows = [r for r in rows if r["alerted"] == alerted]
+        if q:
+            ql = q.lower()
+            rows = [
+                r for r in rows
+                if ql in r["query_name"].lower() or ql in r["client_ip"].lower()
+            ]
+        total = len(rows)
+        return {"total": total, "items": rows[offset:offset + limit]}
+
+    def get(self, record_id: int) -> dict | None:
+        for r in self.records:
+            if r["id"] == record_id:
+                return r
+        return None
+
     def stats(self) -> dict:
         total = len(self.records)
         alerts = sum(1 for r in self.records if r["alerted"])
@@ -147,6 +191,15 @@ class Store:
             "average_score": round(sum(scores) / total, 4) if total else 0.0,
             "max_score": round(max(scores), 4) if scores else 0.0,
         }
+
+    def query_type_counts(self) -> list[dict]:
+        counts: dict[str, int] = {}
+        for r in self.records:
+            counts[r["query_type"]] = counts.get(r["query_type"], 0) + 1
+        return [
+            {"query_type": qt, "count": cnt}
+            for qt, cnt in sorted(counts.items(), key=lambda x: x[1], reverse=True)
+        ]
 
     def top_suspicious(self, limit: int = 10) -> list[dict]:
         agg: dict[str, dict] = {}
@@ -177,30 +230,18 @@ class Store:
             for ip, cnt in sorted(counts.items(), key=lambda x: x[1], reverse=True)[:limit]
         ]
 
-    def is_blocked(self, query_name: str) -> bool:
-        return any(b["query_name"] == query_name for b in self._blocklist)
+    def parent_distribution(self, limit: int = 10) -> list[dict]:
+        counts: dict[str, int] = {}
+        for r in self.records:
+            pd = r.get("parent_domain") or ""
+            if not pd:
+                continue
+            counts[pd] = counts.get(pd, 0) + 1
+        return [
+            {"parent_domain": pd, "count": cnt}
+            for pd, cnt in sorted(counts.items(), key=lambda x: x[1], reverse=True)[:limit]
+        ]
 
-    def list_blocklist(self) -> list[dict]:
-        return list(self._blocklist)
-
-    def add_blocklist(self, query_name: str, reason: str = "") -> dict:
-        if any(b["query_name"] == query_name for b in self._blocklist):
-            raise ValueError("already in blocklist")
-        entry = {
-            "id": len(self._blocklist) + 1,
-            "query_name": query_name,
-            "added_at": datetime.now(UTC).isoformat(timespec="seconds"),
-            "reason": reason,
-        }
-        self._blocklist.append(entry)
-        return entry
-
-    def remove_blocklist(self, entry_id: int) -> bool:
-        for i, b in enumerate(self._blocklist):
-            if b["id"] == entry_id:
-                self._blocklist.pop(i)
-                return True
-        return False
 
 
 class DbStore:
@@ -218,6 +259,18 @@ class DbStore:
         with self._session_factory() as db:
             features = features or {}
             kwargs = {name: float(features.get(name, 0.0)) for name in FEATURE_NAMES}
+            kwargs.update(
+                client_port=data.client_port,
+                proto=data.proto,
+                query_class=data.query_class,
+                parent_domain=parent_domain(data.query_name),
+                subdomain_depth=subdomain_depth(data.query_name),
+                dns_id=data.dns_id,
+                opcode=data.opcode,
+                bufsize=data.bufsize,
+                do_flag=data.do_flag,
+                raw_log=data.raw_log,
+            )
             record = Analysis(
                 client_ip=data.client_ip,
                 query_type=data.query_type,
@@ -244,6 +297,40 @@ class DbStore:
                 .all()
             )
             return [_record_dict(r) for r in records]
+
+    def query(
+        self,
+        limit: int = 50,
+        offset: int = 0,
+        query_type: str | None = None,
+        alerted: bool | None = None,
+        q: str | None = None,
+    ) -> dict:
+        with self._session_factory() as db:
+            base = db.query(Analysis)
+            if query_type:
+                base = base.filter(Analysis.query_type == query_type)
+            if alerted is not None:
+                base = base.filter(Analysis.alerted.is_(alerted))
+            if q:
+                like = f"%{q.lower()}%"
+                base = base.filter(
+                    (func.lower(Analysis.query_name).like(like))
+                    | (func.lower(Analysis.client_ip).like(like))
+                )
+            total = base.with_entities(func.count(Analysis.id)).scalar() or 0
+            rows = (
+                base.order_by(Analysis.created_at.desc())
+                .offset(offset)
+                .limit(limit)
+                .all()
+            )
+            return {"total": int(total), "items": [_record_dict(r) for r in rows]}
+
+    def get(self, record_id: int) -> dict | None:
+        with self._session_factory() as db:
+            r = db.query(Analysis).filter(Analysis.id == record_id).first()
+            return _record_dict(r) if r else None
 
     def stats(self) -> dict:
         with self._session_factory() as db:
@@ -316,48 +403,27 @@ class DbStore:
             )
             return [{"client_ip": r.client_ip, "count": int(r.count)} for r in rows]
 
-    def is_blocked(self, query_name: str) -> bool:
+    def parent_distribution(self, limit: int = 10) -> list[dict]:
         with self._session_factory() as db:
-            return db.query(Blocklist.id).filter(Blocklist.query_name == query_name).first() is not None
+            rows = (
+                db.query(Analysis.parent_domain, func.count(Analysis.id).label("count"))
+                .filter(Analysis.parent_domain != "")
+                .group_by(Analysis.parent_domain)
+                .order_by(func.count(Analysis.id).desc())
+                .limit(limit)
+                .all()
+            )
+            return [{"parent_domain": r.parent_domain, "count": int(r.count)} for r in rows]
 
-    def list_blocklist(self) -> list[dict]:
+    def query_type_counts(self) -> list[dict]:
         with self._session_factory() as db:
-            rows = db.query(Blocklist).order_by(Blocklist.added_at.desc()).all()
-            return [
-                {
-                    "id": r.id,
-                    "query_name": r.query_name,
-                    "added_at": r.added_at.isoformat(timespec="seconds"),
-                    "reason": r.reason,
-                }
-                for r in rows
-            ]
-
-    def add_blocklist(self, query_name: str, reason: str = "") -> dict:
-        with self._session_factory() as db:
-            existing = db.query(Blocklist).filter(Blocklist.query_name == query_name).first()
-            if existing:
-                raise ValueError("already in blocklist")
-            entry = Blocklist(query_name=query_name, reason=reason)
-            db.add(entry)
-            db.commit()
-            db.refresh(entry)
-            return {
-                "id": entry.id,
-                "query_name": entry.query_name,
-                "added_at": entry.added_at.isoformat(timespec="seconds"),
-                "reason": entry.reason,
-            }
-
-    def remove_blocklist(self, entry_id: int) -> bool:
-        with self._session_factory() as db:
-            entry = db.query(Blocklist).filter(Blocklist.id == entry_id).first()
-            if not entry:
-                return False
-            db.delete(entry)
-            db.commit()
-            return True
-
+            rows = (
+                db.query(Analysis.query_type, func.count(Analysis.id).label("count"))
+                .group_by(Analysis.query_type)
+                .order_by(func.count(Analysis.id).desc())
+                .all()
+            )
+            return [{"query_type": r.query_type, "count": int(r.count)} for r in rows]
 
 def random_score(_: AnalysisIn) -> float:
     return round(random.random(), 4)
@@ -418,6 +484,12 @@ def create_app(
 ) -> FastAPI:
     config = config or load_config()
     app = FastAPI(title="DNS Security Analysis")
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
     db_url = os.getenv("DATABASE_URL", "")
     if store is None:
@@ -450,10 +522,7 @@ def create_app(
     @app.post("/analyze", response_model=AnalysisOut)
     def analyze(data: AnalysisIn) -> AnalysisOut:
         features = compute_features(data.query_name)
-        if store.is_blocked(data.query_name):
-            score = 1.0
-        else:
-            score = min(1.0, max(0.0, float(model(data))))
+        score = min(1.0, max(0.0, float(model(data))))
         alerted = score >= config.threshold
         notification_sent = notify(config, data, score) if alerted else False
         record = store.add(data, score, config.threshold, alerted, features)
@@ -466,12 +535,27 @@ def create_app(
         )
 
     @app.get("/analyses")
-    def analyses(limit: int = 50) -> list[dict]:
-        return store.recent(limit)
+    def analyses(
+        limit: int = 50,
+        offset: int = 0,
+        query_type: str | None = None,
+        alerted: bool | None = None,
+        q: str | None = None,
+    ) -> dict:
+        return store.query(limit=limit, offset=offset, query_type=query_type, alerted=alerted, q=q)
+
+    @app.get("/analyses/{record_id}")
+    def analysis_detail(record_id: int) -> dict:
+        record = store.get(record_id)
+        if record is None:
+            raise HTTPException(status_code=404, detail="not found")
+        return record
 
     @app.get("/stats")
     def stats() -> dict:
-        return store.stats()
+        s = store.stats()
+        s["threshold"] = config.threshold
+        return s
 
     @app.get("/stats/top")
     def stats_top(limit: int = 10) -> list[dict]:
@@ -485,22 +569,13 @@ def create_app(
     def stats_clients(limit: int = 10) -> list[dict]:
         return store.client_distribution(limit)
 
-    @app.get("/blocklist", response_model=list[BlocklistOut])
-    def get_blocklist() -> list[dict]:
-        return store.list_blocklist()
+    @app.get("/stats/parents")
+    def stats_parents(limit: int = 10) -> list[dict]:
+        return store.parent_distribution(limit)
 
-    @app.post("/blocklist", response_model=BlocklistOut, status_code=201)
-    def add_to_blocklist(entry: BlocklistIn) -> dict:
-        try:
-            return store.add_blocklist(entry.query_name, entry.reason)
-        except ValueError as exc:
-            raise HTTPException(status_code=409, detail=str(exc))
-
-    @app.delete("/blocklist/{entry_id}", status_code=204, response_class=Response)
-    def delete_from_blocklist(entry_id: int) -> Response:
-        if not store.remove_blocklist(entry_id):
-            raise HTTPException(status_code=404, detail="not found")
-        return Response(status_code=204)
+    @app.get("/stats/types")
+    def stats_types() -> list[dict]:
+        return store.query_type_counts()
 
     @app.get("/dashboard", response_class=HTMLResponse)
     def dashboard() -> str:

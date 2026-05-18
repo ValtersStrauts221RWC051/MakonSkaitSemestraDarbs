@@ -33,6 +33,21 @@ def subdomain_part(name: str) -> str:
     return ".".join(parts[:-2])
 
 
+def parent_domain(name: str) -> str:
+    n = name.rstrip(".")
+    parts = n.split(".")
+    if len(parts) < 2:
+        return n
+    return ".".join(parts[-2:])
+
+
+def subdomain_depth(name: str) -> int:
+    n = name.rstrip(".")
+    if not n:
+        return 0
+    return n.count(".") + 1
+
+
 def f_dns_domain_name_length(full: str) -> float:
     return float(len(full))
 

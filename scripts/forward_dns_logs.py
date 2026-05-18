@@ -37,13 +37,25 @@ def to_payload(entry: dict) -> dict:
         size = int(entry.get("size", 0) or 0)
     except (TypeError, ValueError):
         size = 0
+    try:
+        port = int(entry.get("port", 0) or 0)
+    except (TypeError, ValueError):
+        port = 0
     return {
         "client_ip": entry.get("remote", ""),
+        "client_port": port,
+        "proto": entry.get("proto", "udp"),
         "query_type": entry.get("type", ""),
         "query_name": entry.get("name", ""),
+        "query_class": entry.get("class", "IN"),
         "rcode": entry.get("rcode", "-"),
         "response_size": size,
         "duration_ms": parse_duration_ms(entry.get("duration", 0)),
+        "dns_id": str(entry.get("id", "")),
+        "opcode": str(entry.get("opcode", "")),
+        "bufsize": str(entry.get("bufsize", "")),
+        "do_flag": str(entry.get("do", "")),
+        "raw_log": entry,
     }
 
 

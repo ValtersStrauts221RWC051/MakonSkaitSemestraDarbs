@@ -1,0 +1,7 @@
+. {
+    forward . 8.8.8.8 1.1.1.1
+    log . "{\"remote\":\"{remote}\",\"port\":\"{port}\",\"proto\":\"{proto}\",\"type\":\"{type}\",\"name\":\"{name}\",\"rcode\":\"{rcode}\",\"size\":\"{size}\",\"duration\":\"{duration}\",\"class\":\"{class}\"}"
+    errors
+    cache 30
+    reload
+}

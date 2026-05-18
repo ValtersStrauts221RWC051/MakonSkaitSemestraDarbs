@@ -8,4 +8,4 @@ config.toml
 
 *.txt
 !requirements.txt
-!ml-stuff/requirements.txt
+!ml-stuff/requirements.txt.claude/

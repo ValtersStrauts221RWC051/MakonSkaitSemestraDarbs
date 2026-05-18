@@ -3,5 +3,9 @@ __pycache__/
 .pytest_cache/
 *.pyc
 .runtime/
-
+**/venv/
 config.toml
+
+*.txt
+!requirements.txt
+!ml-stuff/requirements.txt

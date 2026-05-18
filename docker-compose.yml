@@ -42,13 +42,61 @@ services:
     depends_on:
       mattermost-bootstrap:
         condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     environment:
       MODEL_THRESHOLD: "0.0"
+      DATABASE_URL: "postgresql://dns_user:dns_pass@postgres:5432/dns_security"
     volumes:
       - ./.runtime:/runtime
     command: ["./scripts/run_api.sh"]
 
+
+  coredns:
+    image: coredns/coredns:latest
+    container_name: dns-security-coredns
+    ports:
+      - "127.0.0.1:53:53/udp"
+      - "127.0.0.1:53:53/tcp"
+    volumes:
+      - ./coredns/Corefile:/Corefile:ro
+    command: -conf /Corefile
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: dns-security-postgres
+    environment:
+      POSTGRES_DB: dns_security
+      POSTGRES_USER: dns_user
+      POSTGRES_PASSWORD: dns_pass
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dns_user -d dns_security"]
+      interval: 5s
+      retries: 10
+
+  log-forwarder:
+    build: .
+    container_name: dns-security-log-forwarder
+    depends_on:
+      api:
+        condition: service_started
+      coredns:
+        condition: service_started
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    environment:
+      COREDNS_CONTAINER: "dns-security-coredns"
+      API_URL: "http://api:8000/analyze"
+    command: ["python", "scripts/forward_dns_logs.py"]
+    restart: unless-stopped
+
 volumes:
+  postgres-data:
   mattermost-data:

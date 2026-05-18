@@ -10,9 +10,14 @@ from pathlib import Path
 from typing import Callable
 
 import requests
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, Response
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
+from sqlalchemy import case, func
+
+from app.database import Base, make_engine, make_session_factory
+from app.features import FEATURE_NAMES, compute_features
+from app.models import Analysis, Blocklist
 
 
 @dataclass(frozen=True)
@@ -25,9 +30,12 @@ class Config:
 
 
 class AnalysisIn(BaseModel):
-    dns_address: str = Field(..., examples=["10.50.0.102"])
-    request: str = Field(..., examples=["SRV _kerberos._tcp.google.com."])
-    response: str = Field(..., examples=["rcode=- size=43 duration=0.000058525s"])
+    client_ip: str = Field(..., examples=["10.50.0.102"])
+    query_type: str = Field(..., examples=["A"])
+    query_name: str = Field(..., examples=["wikipedia.org."])
+    rcode: str = Field(default="NOERROR", examples=["NOERROR"])
+    response_size: int = Field(default=0, examples=[54])
+    duration_ms: float = Field(default=0.0, examples=[38.5])
 
 
 class AnalysisOut(BaseModel):
@@ -36,6 +44,18 @@ class AnalysisOut(BaseModel):
     threshold: float
     safe: bool
     notification_sent: bool
+
+
+class BlocklistIn(BaseModel):
+    query_name: str = Field(..., examples=["evil.example."])
+    reason: str = Field(default="", examples=["Confirmed C2 endpoint"])
+
+
+class BlocklistOut(BaseModel):
+    id: int
+    query_name: str
+    added_at: str
+    reason: str
 
 
 def load_config(path: str = "config.toml") -> Config:
@@ -60,22 +80,56 @@ def load_config(path: str = "config.toml") -> Config:
     )
 
 
+def _record_dict(record: Analysis | dict) -> dict:
+    if isinstance(record, dict):
+        return record
+    base = {
+        "id": record.id,
+        "created_at": record.created_at.isoformat(timespec="seconds"),
+        "client_ip": record.client_ip,
+        "query_type": record.query_type,
+        "query_name": record.query_name,
+        "rcode": record.rcode,
+        "response_size": record.response_size,
+        "duration_ms": record.duration_ms,
+        "score": record.score,
+        "threshold": record.threshold,
+        "alerted": record.alerted,
+    }
+    for name in FEATURE_NAMES:
+        base[name] = getattr(record, name, 0.0)
+    return base
+
+
 class Store:
     def __init__(self) -> None:
         self.records: list[dict] = []
+        self._blocklist: list[dict] = []
 
-    def add(self, data: AnalysisIn, score: float, threshold: float, alerted: bool) -> dict:
-        created_at = datetime.now(UTC).isoformat(timespec="seconds")
+    def add(
+        self,
+        data: AnalysisIn,
+        score: float,
+        threshold: float,
+        alerted: bool,
+        features: dict[str, float] | None = None,
+    ) -> dict:
         record = {
             "id": len(self.records) + 1,
-            "created_at": created_at,
-            "dns_address": data.dns_address,
-            "request": data.request,
-            "response": data.response,
+            "created_at": datetime.now(UTC).isoformat(timespec="seconds"),
+            "client_ip": data.client_ip,
+            "query_type": data.query_type,
+            "query_name": data.query_name,
+            "rcode": data.rcode,
+            "response_size": data.response_size,
+            "duration_ms": data.duration_ms,
             "score": score,
             "threshold": threshold,
             "alerted": alerted,
         }
+        features = features or {}
+        for name in FEATURE_NAMES:
+            record[name] = float(features.get(name, 0.0))
         self.records.append(record)
         return record
 
@@ -84,8 +138,8 @@ class Store:
 
     def stats(self) -> dict:
         total = len(self.records)
-        alerts = sum(1 for record in self.records if record["alerted"])
-        scores = [record["score"] for record in self.records]
+        alerts = sum(1 for r in self.records if r["alerted"])
+        scores = [r["score"] for r in self.records]
         return {
             "total": total,
             "alerts": alerts,
@@ -94,32 +148,236 @@ class Store:
             "max_score": round(max(scores), 4) if scores else 0.0,
         }
 
+    def top_suspicious(self, limit: int = 10) -> list[dict]:
+        agg: dict[str, dict] = {}
+        for r in self.records:
+            if not r["alerted"]:
+                continue
+            name = r["query_name"]
+            slot = agg.setdefault(name, {"query_name": name, "count": 0, "max_score": 0.0})
+            slot["count"] += 1
+            slot["max_score"] = max(slot["max_score"], r["score"])
+        return sorted(agg.values(), key=lambda x: x["max_score"], reverse=True)[:limit]
+
+    def hourly_counts(self, hours: int = 24) -> list[dict]:
+        buckets: dict[str, dict] = {}
+        for r in self.records:
+            hour = r["created_at"][:13] + ":00:00"
+            slot = buckets.setdefault(hour, {"hour": hour, "total": 0, "alerts": 0})
+            slot["total"] += 1
+            slot["alerts"] += 1 if r["alerted"] else 0
+        return sorted(buckets.values(), key=lambda x: x["hour"])[-hours:]
+
+    def client_distribution(self, limit: int = 10) -> list[dict]:
+        counts: dict[str, int] = {}
+        for r in self.records:
+            counts[r["client_ip"]] = counts.get(r["client_ip"], 0) + 1
+        return [
+            {"client_ip": ip, "count": cnt}
+            for ip, cnt in sorted(counts.items(), key=lambda x: x[1], reverse=True)[:limit]
+        ]
+
+    def is_blocked(self, query_name: str) -> bool:
+        return any(b["query_name"] == query_name for b in self._blocklist)
+
+    def list_blocklist(self) -> list[dict]:
+        return list(self._blocklist)
+
+    def add_blocklist(self, query_name: str, reason: str = "") -> dict:
+        if any(b["query_name"] == query_name for b in self._blocklist):
+            raise ValueError("already in blocklist")
+        entry = {
+            "id": len(self._blocklist) + 1,
+            "query_name": query_name,
+            "added_at": datetime.now(UTC).isoformat(timespec="seconds"),
+            "reason": reason,
+        }
+        self._blocklist.append(entry)
+        return entry
+
+    def remove_blocklist(self, entry_id: int) -> bool:
+        for i, b in enumerate(self._blocklist):
+            if b["id"] == entry_id:
+                self._blocklist.pop(i)
+                return True
+        return False
+
+
+class DbStore:
+    def __init__(self, session_factory) -> None:
+        self._session_factory = session_factory
+
+    def add(
+        self,
+        data: AnalysisIn,
+        score: float,
+        threshold: float,
+        alerted: bool,
+        features: dict[str, float] | None = None,
+    ) -> dict:
+        with self._session_factory() as db:
+            features = features or {}
+            kwargs = {name: float(features.get(name, 0.0)) for name in FEATURE_NAMES}
+            record = Analysis(
+                client_ip=data.client_ip,
+                query_type=data.query_type,
+                query_name=data.query_name,
+                rcode=data.rcode,
+                response_size=data.response_size,
+                duration_ms=data.duration_ms,
+                score=score,
+                threshold=threshold,
+                alerted=alerted,
+                **kwargs,
+            )
+            db.add(record)
+            db.commit()
+            db.refresh(record)
+            return _record_dict(record)
+
+    def recent(self, limit: int = 50) -> list[dict]:
+        with self._session_factory() as db:
+            records = (
+                db.query(Analysis)
+                .order_by(Analysis.created_at.desc())
+                .limit(limit)
+                .all()
+            )
+            return [_record_dict(r) for r in records]
+
+    def stats(self) -> dict:
+        with self._session_factory() as db:
+            total = db.query(func.count(Analysis.id)).scalar() or 0
+            alerts = (
+                db.query(func.count(Analysis.id))
+                .filter(Analysis.alerted.is_(True))
+                .scalar() or 0
+            )
+            avg_score = db.query(func.avg(Analysis.score)).scalar() or 0.0
+            max_score = db.query(func.max(Analysis.score)).scalar() or 0.0
+            return {
+                "total": total,
+                "alerts": alerts,
+                "safe": total - alerts,
+                "average_score": round(float(avg_score), 4),
+                "max_score": round(float(max_score), 4),
+            }
+
+    def top_suspicious(self, limit: int = 10) -> list[dict]:
+        with self._session_factory() as db:
+            rows = (
+                db.query(
+                    Analysis.query_name,
+                    func.count(Analysis.id).label("count"),
+                    func.max(Analysis.score).label("max_score"),
+                )
+                .filter(Analysis.alerted.is_(True))
+                .group_by(Analysis.query_name)
+                .order_by(func.max(Analysis.score).desc())
+                .limit(limit)
+                .all()
+            )
+            return [
+                {"query_name": r.query_name, "count": int(r.count), "max_score": round(float(r.max_score), 4)}
+                for r in rows
+            ]
+
+    def hourly_counts(self, hours: int = 24) -> list[dict]:
+        with self._session_factory() as db:
+            bucket = func.date_trunc("hour", Analysis.created_at)
+            rows = (
+                db.query(
+                    bucket.label("hour"),
+                    func.count(Analysis.id).label("total"),
+                    func.sum(case((Analysis.alerted.is_(True), 1), else_=0)).label("alerts"),
+                )
+                .group_by(bucket)
+                .order_by(bucket.desc())
+                .limit(hours)
+                .all()
+            )
+            return [
+                {
+                    "hour": r.hour.isoformat(timespec="seconds") if r.hour else None,
+                    "total": int(r.total),
+                    "alerts": int(r.alerts or 0),
+                }
+                for r in reversed(rows)
+            ]
+
+    def client_distribution(self, limit: int = 10) -> list[dict]:
+        with self._session_factory() as db:
+            rows = (
+                db.query(Analysis.client_ip, func.count(Analysis.id).label("count"))
+                .group_by(Analysis.client_ip)
+                .order_by(func.count(Analysis.id).desc())
+                .limit(limit)
+                .all()
+            )
+            return [{"client_ip": r.client_ip, "count": int(r.count)} for r in rows]
+
+    def is_blocked(self, query_name: str) -> bool:
+        with self._session_factory() as db:
+            return db.query(Blocklist.id).filter(Blocklist.query_name == query_name).first() is not None
+
+    def list_blocklist(self) -> list[dict]:
+        with self._session_factory() as db:
+            rows = db.query(Blocklist).order_by(Blocklist.added_at.desc()).all()
+            return [
+                {
+                    "id": r.id,
+                    "query_name": r.query_name,
+                    "added_at": r.added_at.isoformat(timespec="seconds"),
+                    "reason": r.reason,
+                }
+                for r in rows
+            ]
+
+    def add_blocklist(self, query_name: str, reason: str = "") -> dict:
+        with self._session_factory() as db:
+            existing = db.query(Blocklist).filter(Blocklist.query_name == query_name).first()
+            if existing:
+                raise ValueError("already in blocklist")
+            entry = Blocklist(query_name=query_name, reason=reason)
+            db.add(entry)
+            db.commit()
+            db.refresh(entry)
+            return {
+                "id": entry.id,
+                "query_name": entry.query_name,
+                "added_at": entry.added_at.isoformat(timespec="seconds"),
+                "reason": entry.reason,
+            }
+
+    def remove_blocklist(self, entry_id: int) -> bool:
+        with self._session_factory() as db:
+            entry = db.query(Blocklist).filter(Blocklist.id == entry_id).first()
+            if not entry:
+                return False
+            db.delete(entry)
+            db.commit()
+            return True
+
 
 def random_score(_: AnalysisIn) -> float:
     return round(random.random(), 4)
-
-
-def _extract_query_name(request: str) -> str:
-    parts = request.split(" ", 1)
-    return parts[1].strip() if len(parts) > 1 else parts[0].strip()
 
 
 def make_onnx_scorer(model_path: str) -> Callable[[AnalysisIn], float]:
     import numpy as np
     import onnxruntime as ort
 
-    from inference_onnx import extract_features
+    from app.features import extract_features
 
     sess = ort.InferenceSession(model_path, providers=["CPUExecutionProvider"])
     in_name = sess.get_inputs()[0].name
     out_name = sess.get_outputs()[0].name
 
     def score(data: AnalysisIn) -> float:
-        name = _extract_query_name(data.request)
-        if not name:
+        if not data.query_name:
             return 0.0
-        features = extract_features(name)
-        batch = np.expand_dims(features, axis=0)
+        features = extract_features(data.query_name)
+        batch = np.array([features], dtype=np.float32)
         probs = sess.run([out_name], {in_name: batch})[0]
         return float(probs.flatten()[0])
 
@@ -134,11 +392,10 @@ def send_mattermost(config: Config, data: AnalysisIn, score: float) -> bool:
 
     message = (
         "### DNS security alert\n"
-        f"- DNS address: `{data.dns_address}`\n"
-        f"- Risk score: `{score:.4f}`\n"
-        f"- Threshold: `{config.threshold:.4f}`\n"
-        f"- Request: `{data.request}`\n"
-        f"- Response: `{data.response}`"
+        f"- Query: `{data.query_type} {data.query_name}`\n"
+        f"- Client IP: `{data.client_ip}`\n"
+        f"- Risk score: `{score:.4f}` (threshold `{config.threshold:.4f}`)\n"
+        f"- Response: `rcode={data.rcode} size={data.response_size} duration={data.duration_ms:.2f}ms`"
     )
     try:
         response = requests.post(
@@ -155,12 +412,22 @@ def send_mattermost(config: Config, data: AnalysisIn, score: float) -> bool:
 
 def create_app(
     config: Config | None = None,
-    store: Store | None = None,
+    store: Store | DbStore | None = None,
     model: Callable[[AnalysisIn], float] | None = None,
     notify: Callable[[Config, AnalysisIn, float], bool] = send_mattermost,
 ) -> FastAPI:
     config = config or load_config()
-    store = store or Store()
+    app = FastAPI(title="DNS Security Analysis")
+
+    db_url = os.getenv("DATABASE_URL", "")
+    if store is None:
+        if db_url:
+            engine = make_engine(db_url)
+            Base.metadata.create_all(bind=engine)
+            store = DbStore(make_session_factory(engine))
+        else:
+            store = Store()
+
     if model is None:
         model_path = os.getenv("MODEL_PATH", "model.onnx")
         if Path(model_path).exists():
@@ -175,7 +442,6 @@ def create_app(
                 model = random_score
         else:
             model = random_score
-    app = FastAPI(title="DNS Security Analysis")
 
     @app.get("/health")
     def health() -> dict:
@@ -183,10 +449,14 @@ def create_app(
 
     @app.post("/analyze", response_model=AnalysisOut)
     def analyze(data: AnalysisIn) -> AnalysisOut:
-        score = min(1.0, max(0.0, float(model(data))))
+        features = compute_features(data.query_name)
+        if store.is_blocked(data.query_name):
+            score = 1.0
+        else:
+            score = min(1.0, max(0.0, float(model(data))))
         alerted = score >= config.threshold
         notification_sent = notify(config, data, score) if alerted else False
-        record = store.add(data, score, config.threshold, alerted)
+        record = store.add(data, score, config.threshold, alerted, features)
         return AnalysisOut(
             id=record["id"],
             score=score,
@@ -203,6 +473,35 @@ def create_app(
     def stats() -> dict:
         return store.stats()
 
+    @app.get("/stats/top")
+    def stats_top(limit: int = 10) -> list[dict]:
+        return store.top_suspicious(limit)
+
+    @app.get("/stats/hourly")
+    def stats_hourly(hours: int = 24) -> list[dict]:
+        return store.hourly_counts(hours)
+
+    @app.get("/stats/clients")
+    def stats_clients(limit: int = 10) -> list[dict]:
+        return store.client_distribution(limit)
+
+    @app.get("/blocklist", response_model=list[BlocklistOut])
+    def get_blocklist() -> list[dict]:
+        return store.list_blocklist()
+
+    @app.post("/blocklist", response_model=BlocklistOut, status_code=201)
+    def add_to_blocklist(entry: BlocklistIn) -> dict:
+        try:
+            return store.add_blocklist(entry.query_name, entry.reason)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
+
+    @app.delete("/blocklist/{entry_id}", status_code=204, response_class=Response)
+    def delete_from_blocklist(entry_id: int) -> Response:
+        if not store.remove_blocklist(entry_id):
+            raise HTTPException(status_code=404, detail="not found")
+        return Response(status_code=204)
+
     @app.get("/dashboard", response_class=HTMLResponse)
     def dashboard() -> str:
         return render_dashboard(store.stats(), store.recent(25), config.threshold)
@@ -212,8 +511,10 @@ def create_app(
 
 def render_dashboard(stats: dict, records: list[dict], threshold: float) -> str:
     rows = "".join(
-        f"<tr><td>{r['created_at']}</td><td>{html.escape(r['dns_address'])}</td>"
-        f"<td>{html.escape(r['request'])}</td><td>{r['score']:.4f}</td>"
+        f"<tr><td>{r['created_at']}</td>"
+        f"<td>{html.escape(r['client_ip'])}</td>"
+        f"<td>{html.escape(r['query_type'])} {html.escape(r['query_name'])}</td>"
+        f"<td>{r['score']:.4f}</td>"
         f"<td class=\"{'bad' if r['alerted'] else 'good'}\">{'Alert' if r['alerted'] else 'Safe'}</td></tr>"
         for r in records
     ) or "<tr><td colspan='5'>No analyses yet</td></tr>"
@@ -240,7 +541,6 @@ def render_dashboard(stats: dict, records: list[dict], threshold: float) -> str:
         th {{ background: #e9eef5; }}
         .good {{ color: #2f8f5b; font-weight: 700; }}
         .bad {{ color: #c43d3d; font-weight: 700; }}
-        @media (max-width: 720px) {{ header, main {{ padding-left: 16px; padding-right: 16px; }} table {{ display: block; overflow-x: auto; }} }}
       </style>
     </head>
     <body>
@@ -254,7 +554,7 @@ def render_dashboard(stats: dict, records: list[dict], threshold: float) -> str:
           <div class="card"><div class="label">Max score</div><div class="value">{stats['max_score']:.2f}</div></div>
         </section>
         <table>
-          <thead><tr><th>Time</th><th>DNS address</th><th>Request</th><th>Score</th><th>Status</th></tr></thead>
+          <thead><tr><th>Time</th><th>Client</th><th>Query</th><th>Score</th><th>Status</th></tr></thead>
           <tbody>{rows}</tbody>
         </table>
       </main>

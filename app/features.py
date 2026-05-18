@@ -1,11 +1,35 @@
 from __future__ import annotations
 
+import json
 import math
+import re
 from collections import Counter
 
 VOWELS = frozenset("aeiou")
 ALPHA = frozenset("abcdefghijklmnopqrstuvwxyz")
 CONSONANTS = ALPHA - VOWELS
+
+INFO_LINE_RE = re.compile(r"^\[INFO\]\s+(\{.*\})\s*$")
+
+
+def parse_log_line(line: str) -> dict | None:
+    if not line:
+        return None
+    m = INFO_LINE_RE.match(line.strip())
+    if not m:
+        return None
+    try:
+        return json.loads(m.group(1))
+    except json.JSONDecodeError:
+        return None
+
+
+def get_name(entry: dict) -> str:
+    return entry.get("name") or entry.get("query_name") or ""
+
+
+def get_type(entry: dict) -> str:
+    return entry.get("type") or entry.get("query_type") or ""
 
 FEATURE_NAMES = [
     "dns_domain_name_length",

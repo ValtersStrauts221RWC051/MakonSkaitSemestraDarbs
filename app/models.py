@@ -49,3 +49,22 @@ class Analysis(Base):
     alerted: Mapped[bool] = mapped_column(Boolean)
 
 
+class DomainInfo(Base):
+    __tablename__ = "domain_info"
+
+    parent_domain: Mapped[str] = mapped_column(String, primary_key=True)
+    ip: Mapped[str] = mapped_column(String, default="")
+    country: Mapped[str] = mapped_column(String, default="", index=True)
+    country_code: Mapped[str] = mapped_column(String, default="", index=True)
+    city: Mapped[str] = mapped_column(String, default="")
+    isp: Mapped[str] = mapped_column(String, default="")
+    registrar: Mapped[str] = mapped_column(String, default="")
+    creation_date: Mapped[str] = mapped_column(String, default="")
+    whois_country: Mapped[str] = mapped_column(String, default="")
+    looked_up_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+    )
+    error: Mapped[str] = mapped_column(String, default="")
+
+

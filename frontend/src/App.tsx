@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { api } from "./api/client";
 import { AnalysesTable } from "./components/AnalysesTable";
+import { CountryMap } from "./components/CountryMap";
 import { DetailModal } from "./components/DetailModal";
 import { HourlyChart } from "./components/HourlyChart";
 import { QueryTypeChart } from "./components/QueryTypeChart";
@@ -11,6 +12,7 @@ import { useAutoRefresh } from "./hooks/useAutoRefresh";
 import type {
   Analysis,
   AnalysesFilters,
+  CountryStat,
   HourlyBucket,
   ParentDist,
   QueryTypeCount,
@@ -24,6 +26,8 @@ export default function App() {
   const [hourly, setHourly] = useState<HourlyBucket[]>([]);
   const [parents, setParents] = useState<ParentDist[]>([]);
   const [types, setTypes] = useState<QueryTypeCount[]>([]);
+  const [countries, setCountries] = useState<CountryStat[]>([]);
+  const [enriching, setEnriching] = useState(false);
   const [analyses, setAnalyses] = useState<Analysis[]>([]);
   const [analysesTotal, setAnalysesTotal] = useState(0);
   const [filters, setFilters] = useState<AnalysesFilters>({ limit: 25, offset: 0 });
@@ -34,12 +38,13 @@ export default function App() {
 
   const load = useCallback(async () => {
     try {
-      const [s, t, h, p, qt, a] = await Promise.all([
+      const [s, t, h, p, qt, co, a] = await Promise.all([
         api.stats(),
         api.topSuspicious(10),
         api.hourly(24),
         api.parents(10),
         api.types(),
+        api.countries(),
         api.analyses(filters),
       ]);
       setStats(s);
@@ -47,6 +52,7 @@ export default function App() {
       setHourly(h);
       setParents(p);
       setTypes(qt);
+      setCountries(co);
       setAnalyses(a.items);
       setAnalysesTotal(a.total);
       setLastUpdate(new Date());
@@ -58,6 +64,16 @@ export default function App() {
 
   useEffect(() => { load(); }, [load]);
   useAutoRefresh(load, autoRefresh, 5000);
+
+  async function runEnrich() {
+    setEnriching(true);
+    try {
+      await api.enrich(10);
+      await load();
+    } finally {
+      setEnriching(false);
+    }
+  }
 
   return (
     <>
@@ -88,6 +104,15 @@ export default function App() {
         <div className="row">
           <TopDomainsChart data={parents} />
           <QueryTypeChart data={types} />
+        </div>
+
+        <div style={{ marginBottom: 16 }}>
+          <CountryMap data={countries} />
+          <div style={{ textAlign: "right", marginTop: 8 }}>
+            <button className="secondary" onClick={runEnrich} disabled={enriching}>
+              {enriching ? "Enriching…" : "Enrich next 10 domains"}
+            </button>
+          </div>
         </div>
 
         <AnalysesTable

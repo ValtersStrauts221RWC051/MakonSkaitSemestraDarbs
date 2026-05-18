@@ -73,6 +73,13 @@ export interface QueryTypeCount {
   count: number;
 }
 
+export interface CountryStat {
+  country_code: string;
+  country: string;
+  total: number;
+  alerts: number;
+}
+
 export interface AnalysesFilters {
   limit?: number;
   offset?: number;

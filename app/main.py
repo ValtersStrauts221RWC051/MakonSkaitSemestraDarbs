@@ -19,8 +19,9 @@ from pydantic import BaseModel, Field
 from sqlalchemy import case, func
 
 from app.database import Base, make_engine, make_session_factory
+from app.enrichment import enrich
 from app.features import FEATURE_NAMES, compute_features, parent_domain, subdomain_depth
-from app.models import Analysis
+from app.models import Analysis, DomainInfo
 
 
 @dataclass(frozen=True)
@@ -353,6 +354,40 @@ class Store:
             for pd, cnt in sorted(counts.items(), key=lambda x: x[1], reverse=True)[:limit]
         ]
 
+    def country_distribution(self) -> list[dict]:
+        info_map: dict[str, dict] = getattr(self, "_domain_info", {})
+        agg: dict[str, dict] = {}
+        for r in self.records:
+            pd = r.get("parent_domain") or ""
+            info = info_map.get(pd) or {}
+            code = info.get("country_code", "") or "??"
+            name = info.get("country", "") or "Unknown"
+            slot = agg.setdefault(code, {"country_code": code, "country": name, "total": 0, "alerts": 0})
+            slot["total"] += 1
+            if r.get("alerted"):
+                slot["alerts"] += 1
+        return sorted(agg.values(), key=lambda x: x["total"], reverse=True)
+
+    def unenriched_parents(self, limit: int = 20) -> list[str]:
+        info_map: dict[str, dict] = getattr(self, "_domain_info", {})
+        seen: dict[str, None] = {}
+        for r in self.records:
+            pd = r.get("parent_domain") or ""
+            if pd and pd not in info_map and pd not in seen:
+                seen[pd] = None
+                if len(seen) >= limit:
+                    break
+        return list(seen)
+
+    def save_domain_info(self, info: dict) -> None:
+        if not hasattr(self, "_domain_info"):
+            self._domain_info: dict[str, dict] = {}
+        self._domain_info[info["parent_domain"]] = info
+
+    def list_domain_info(self) -> list[dict]:
+        info_map: dict[str, dict] = getattr(self, "_domain_info", {})
+        return list(info_map.values())
+
 
 
 class DbStore:
@@ -535,6 +570,96 @@ class DbStore:
                 .all()
             )
             return [{"query_type": r.query_type, "count": int(r.count)} for r in rows]
+
+    def country_distribution(self) -> list[dict]:
+        with self._session_factory() as db:
+            rows = (
+                db.query(
+                    func.coalesce(DomainInfo.country_code, "").label("country_code"),
+                    func.coalesce(DomainInfo.country, "Unknown").label("country"),
+                    func.count(Analysis.id).label("total"),
+                    func.sum(case((Analysis.alerted.is_(True), 1), else_=0)).label("alerts"),
+                )
+                .outerjoin(DomainInfo, Analysis.parent_domain == DomainInfo.parent_domain)
+                .group_by(DomainInfo.country_code, DomainInfo.country)
+                .order_by(func.count(Analysis.id).desc())
+                .all()
+            )
+            return [
+                {
+                    "country_code": r.country_code or "??",
+                    "country": r.country or "Unknown",
+                    "total": int(r.total),
+                    "alerts": int(r.alerts or 0),
+                }
+                for r in rows
+            ]
+
+    def unenriched_parents(self, limit: int = 20) -> list[str]:
+        with self._session_factory() as db:
+            rows = (
+                db.query(Analysis.parent_domain)
+                .outerjoin(DomainInfo, Analysis.parent_domain == DomainInfo.parent_domain)
+                .filter(Analysis.parent_domain != "")
+                .filter(DomainInfo.parent_domain.is_(None))
+                .distinct()
+                .limit(limit)
+                .all()
+            )
+            return [r.parent_domain for r in rows]
+
+    def save_domain_info(self, info: dict) -> None:
+        from sqlalchemy.dialects.postgresql import insert
+        with self._session_factory() as db:
+            stmt = insert(DomainInfo).values(
+                parent_domain=info.get("parent_domain", ""),
+                ip=info.get("ip", ""),
+                country=info.get("country", ""),
+                country_code=info.get("country_code", ""),
+                city=info.get("city", ""),
+                isp=info.get("isp", ""),
+                registrar=info.get("registrar", ""),
+                creation_date=info.get("creation_date", ""),
+                whois_country=info.get("whois_country", ""),
+                error=info.get("error", ""),
+                looked_up_at=info.get("looked_up_at"),
+            )
+            stmt = stmt.on_conflict_do_update(
+                index_elements=["parent_domain"],
+                set_={
+                    "ip": stmt.excluded.ip,
+                    "country": stmt.excluded.country,
+                    "country_code": stmt.excluded.country_code,
+                    "city": stmt.excluded.city,
+                    "isp": stmt.excluded.isp,
+                    "registrar": stmt.excluded.registrar,
+                    "creation_date": stmt.excluded.creation_date,
+                    "whois_country": stmt.excluded.whois_country,
+                    "error": stmt.excluded.error,
+                    "looked_up_at": stmt.excluded.looked_up_at,
+                },
+            )
+            db.execute(stmt)
+            db.commit()
+
+    def list_domain_info(self) -> list[dict]:
+        with self._session_factory() as db:
+            rows = db.query(DomainInfo).all()
+            return [
+                {
+                    "parent_domain": r.parent_domain,
+                    "ip": r.ip,
+                    "country": r.country,
+                    "country_code": r.country_code,
+                    "city": r.city,
+                    "isp": r.isp,
+                    "registrar": r.registrar,
+                    "creation_date": r.creation_date,
+                    "whois_country": r.whois_country,
+                    "error": r.error,
+                }
+                for r in rows
+            ]
 
 def random_score(_: AnalysisIn) -> float:
     return round(random.random(), 4)
@@ -726,6 +851,24 @@ def create_app(
     @app.get("/stats/types")
     def stats_types() -> list[dict]:
         return store.query_type_counts()
+
+    @app.get("/stats/countries")
+    def stats_countries() -> list[dict]:
+        return store.country_distribution()
+
+    @app.get("/domain-info")
+    def domain_info_list() -> list[dict]:
+        return store.list_domain_info()
+
+    @app.post("/admin/enrich")
+    def admin_enrich(limit: int = 5) -> dict:
+        targets = store.unenriched_parents(limit)
+        enriched: list[dict] = []
+        for parent_dom in targets:
+            info = enrich(parent_dom)
+            store.save_domain_info(info)
+            enriched.append(info)
+        return {"requested": len(targets), "enriched": len(enriched), "items": enriched}
 
     @app.get("/dashboard", response_class=HTMLResponse)
     def dashboard() -> str:

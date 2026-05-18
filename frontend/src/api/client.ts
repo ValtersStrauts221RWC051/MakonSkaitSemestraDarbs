@@ -3,6 +3,7 @@ import type {
   AnalysesFilters,
   AnalysesResponse,
   ClientDist,
+  CountryStat,
   HourlyBucket,
   ParentDist,
   QueryTypeCount,
@@ -25,6 +26,9 @@ export const api = {
   clients: (limit = 10) => get<ClientDist[]>(`/stats/clients?limit=${limit}`),
   parents: (limit = 10) => get<ParentDist[]>(`/stats/parents?limit=${limit}`),
   types: () => get<QueryTypeCount[]>("/stats/types"),
+  countries: () => get<CountryStat[]>("/stats/countries"),
+  enrich: (limit = 5) =>
+    fetch(`${API_BASE}/admin/enrich?limit=${limit}`, { method: "POST" }).then((r) => r.json()),
   analyses: (f: AnalysesFilters = {}) => {
     const p = new URLSearchParams();
     if (f.limit !== undefined) p.set("limit", String(f.limit));

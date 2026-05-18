@@ -3,6 +3,7 @@ from __future__ import annotations
 import html
 import os
 import random
+import re
 import tomllib
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -30,6 +31,45 @@ class Config:
     mattermost_enabled: bool = False
 
 
+logger = logging.getLogger(__name__)
+
+
+_REQUEST_RE = re.compile(r"^(?P<qtype>\S+)\s+(?P<qname>\S+)$")
+_RESPONSE_RE = re.compile(
+    r"rcode=(?P<rcode>\S+)|size=(?P<size>\d+)|duration=(?P<duration>\d+(?:\.\d+)?)s?"
+)
+
+
+def _safe_int(value: str | int | None) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _parse_duration(value: str | None) -> float:
+    if not value:
+        return 0.0
+    try:
+        return float(value) * 1000.0
+    except ValueError:
+        return 0.0
+
+
+def _parse_response(text: str) -> tuple[str, int, float]:
+    rcode = ""
+    size = 0
+    duration_ms = 0.0
+    for match in _RESPONSE_RE.finditer(text):
+        if match.group("rcode"):
+            rcode = match.group("rcode")
+        elif match.group("size"):
+            size = int(match.group("size"))
+        elif match.group("duration"):
+            duration_ms = float(match.group("duration")) * 1000.0
+    return rcode, size, duration_ms
+
+
 class AnalysisIn(BaseModel):
     client_ip: str = Field(..., examples=["10.50.0.102"])
     client_port: int = Field(default=0, examples=[58954])
@@ -53,6 +93,76 @@ class AnalysisOut(BaseModel):
     threshold: float
     safe: bool
     notification_sent: bool
+
+
+class AnalysisRequest(BaseModel):
+    client_ip: str | None = None
+    query_type: str | None = None
+    query_name: str | None = None
+    rcode: str | None = None
+    response_size: int | None = None
+    duration_ms: float | None = None
+    dns_address: str | None = None
+    request: str | None = None
+    response: str | None = None
+
+    def to_analysis(self) -> AnalysisIn:
+        client_ip = self.client_ip or self.dns_address or ""
+        query_type = self.query_type or ""
+        query_name = self.query_name or ""
+        rcode = self.rcode
+        response_size = self.response_size
+        duration_ms = self.duration_ms
+
+        if self.request:
+            entry = parse_log_line(self.request)
+            if entry is not None:
+                query_type = query_type or get_type(entry)
+                query_name = query_name or get_name(entry)
+                client_ip = client_ip or entry.get("src_ip") or entry.get("remote")
+            else:
+                request_match = _REQUEST_RE.match(self.request.strip())
+                if request_match:
+                    query_type = query_type or request_match.group("qtype")
+                    query_name = query_name or request_match.group("qname")
+
+        if self.response:
+            entry = parse_log_line(self.response)
+            if entry is not None:
+                rcode = rcode or entry.get("rcode") or entry.get("response_code")
+                response_size = response_size if response_size is not None else _safe_int(entry.get("size"))
+                duration_ms = duration_ms if duration_ms is not None else _parse_duration(entry.get("duration"))
+            else:
+                parsed = _parse_response(self.response)
+                rcode = rcode or parsed[0]
+                response_size = response_size if response_size is not None else parsed[1]
+                duration_ms = duration_ms if duration_ms is not None else parsed[2]
+
+        if not client_ip:
+            raise ValueError("client_ip or dns_address is required")
+        if not query_name:
+            raise ValueError("query_name is required")
+
+        return AnalysisIn(
+            client_ip=client_ip,
+            query_type=query_type or "A",
+            query_name=query_name,
+            rcode=rcode or "NOERROR",
+            response_size=response_size or 0,
+            duration_ms=duration_ms or 0.0,
+        )
+
+
+class BlocklistIn(BaseModel):
+    query_name: str = Field(..., examples=["evil.example."])
+    reason: str = Field(default="", examples=["Confirmed C2 endpoint"])
+
+
+class BlocklistOut(BaseModel):
+    id: int
+    query_name: str
+    added_at: str
+    reason: str
 
 
 def load_config(path: str = "config.toml") -> Config:
@@ -429,6 +539,9 @@ def random_score(_: AnalysisIn) -> float:
     return round(random.random(), 4)
 
 
+random_score.__onnx__ = False
+
+
 def make_onnx_scorer(model_path: str) -> Callable[[AnalysisIn], float]:
     import numpy as np
     import onnxruntime as ort
@@ -446,6 +559,8 @@ def make_onnx_scorer(model_path: str) -> Callable[[AnalysisIn], float]:
         batch = np.array([features], dtype=np.float32)
         probs = sess.run([out_name], {in_name: batch})[0]
         return float(probs.flatten()[0])
+
+    score.__onnx__ = True
 
     return score
 
@@ -515,17 +630,55 @@ def create_app(
         else:
             model = random_score
 
+    # Log which model was selected
+    try:
+        is_onnx = getattr(model, "__onnx__", False)
+        if is_onnx:
+            logger.info("Using ONNX model from %s", os.getenv("MODEL_PATH", "model.onnx"))
+        else:
+            logger.info("Using fallback/random model (ONNX not used)")
+    except Exception:
+        logger.debug("Unable to determine model type for logging")
+
     @app.get("/health")
     def health() -> dict:
         return {"status": "ok"}
 
     @app.post("/analyze", response_model=AnalysisOut)
-    def analyze(data: AnalysisIn) -> AnalysisOut:
-        features = compute_features(data.query_name)
-        score = min(1.0, max(0.0, float(model(data))))
+    def analyze(data: AnalysisRequest) -> AnalysisOut:
+        logger.info("Received /analyze request: %s", data.dict())
+        try:
+            analysis = data.to_analysis()
+        except ValueError as exc:
+            logger.warning("Invalid analyze request: %s", exc)
+            raise HTTPException(status_code=422, detail=str(exc))
+
+        logger.debug("Normalized analysis input: %s", analysis.dict())
+        features = compute_features(analysis.query_name)
+        logger.debug("Computed features for %s: %s", analysis.query_name, features)
+
+        model_is_onnx = getattr(model, "__onnx__", False)
+        if store.is_blocked(analysis.query_name):
+            logger.info("Query %s is blocklisted, forcing score=1.0", analysis.query_name)
+            score = 1.0
+        else:
+            logger.debug("Scoring with model (onnx=%s) for %s", model_is_onnx, analysis.query_name)
+            score = min(1.0, max(0.0, float(model(analysis))))
+
         alerted = score >= config.threshold
-        notification_sent = notify(config, data, score) if alerted else False
-        record = store.add(data, score, config.threshold, alerted, features)
+        notification_sent = notify(config, analysis, score) if alerted else False
+        record = store.add(analysis, score, config.threshold, alerted, features)
+
+        logger.info(
+            "Analysis result: id=%s score=%.4f threshold=%.4f safe=%s onnx=%s notified=%s",
+            record.get("id"),
+            score,
+            config.threshold,
+            not alerted,
+            model_is_onnx,
+            notification_sent,
+        )
+
         return AnalysisOut(
             id=record["id"],
             score=score,

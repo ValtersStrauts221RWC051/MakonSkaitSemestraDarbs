@@ -47,7 +47,7 @@ services:
     ports:
       - "127.0.0.1:8000:8000"
     environment:
-      MODEL_THRESHOLD: "0.0"
+      MODEL_THRESHOLD: "0.5"
       DATABASE_URL: "postgresql://dns_user:dns_pass@postgres:5432/dns_security"
     volumes:
       - ./.runtime:/runtime

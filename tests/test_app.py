@@ -48,9 +48,10 @@ def test_stats_and_recent_use_new_fields():
 
     assert client.get("/stats").json()["alerts"] == 1
     recent = client.get("/analyses").json()
-    assert recent[0]["query_name"] == "example.com."
-    assert recent[0]["client_ip"] == "10.50.0.102"
-    assert recent[0]["query_type"] == "A"
+    assert recent["total"] == 1
+    assert recent["items"][0]["query_name"] == "example.com."
+    assert recent["items"][0]["client_ip"] == "10.50.0.102"
+    assert recent["items"][0]["query_type"] == "A"
     assert "DNS Security Dashboard" in client.get("/dashboard").text
 
 

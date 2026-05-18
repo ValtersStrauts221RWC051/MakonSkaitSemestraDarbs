@@ -1,6 +1,6 @@
 . {
     forward . 8.8.8.8 1.1.1.1
-    log . "{\"remote\":\"{remote}\",\"port\":\"{port}\",\"proto\":\"{proto}\",\"type\":\"{type}\",\"name\":\"{name}\",\"rcode\":\"{rcode}\",\"size\":\"{size}\",\"duration\":\"{duration}\",\"class\":\"{class}\"}"
+    log . "{\"remote\":\"{remote}\",\"port\":\"{port}\",\"proto\":\"{proto}\",\"type\":\"{type}\",\"name\":\"{name}\",\"rcode\":\"{rcode}\",\"size\":\"{size}\",\"duration\":\"{duration}\",\"class\":\"{class}\",\"id\":\"{>id}\",\"opcode\":\"{>opcode}\",\"bufsize\":\"{>bufsize}\",\"do\":\"{>do}\"}"
     errors
     cache 30
     reload

@@ -8,7 +8,8 @@ System that intercepts every DNS query from the host, computes ML features over 
 |---|---|---|---|
 | **coredns** | `dns-security-coredns` | 127.0.0.1:53 | Catches every DNS query the host makes |
 | **log-forwarder** | `dns-security-log-forwarder` | — | Streams CoreDNS logs → `POST /analyze` |
-| **api** | `dns-security-api` | 127.0.0.1:8000 | FastAPI, feature extraction, model, dashboard |
+| **api** | `dns-security-api` | 127.0.0.1:8000 | FastAPI, feature extraction, model, legacy HTML dashboard |
+| **frontend** | `dns-security-frontend` | 127.0.0.1:3000 | React + Vite SPA with charts, filters, blocklist UI |
 | **postgres** | `dns-security-postgres` | 127.0.0.1:5432 | Persistent storage for analyses + blocklist |
 | **mattermost** | `dns-security-mattermost` | 8065 | Notification destination |
 
@@ -30,8 +31,9 @@ sudo chattr +i /etc/resolv.conf
 
 ### URLs
 
-- API: `http://127.0.0.1:8000`
-- Dashboard (HTML): `http://127.0.0.1:8000/dashboard`
+- **React dashboard: `http://127.0.0.1:3000`** ← main UI (charts, filters, blocklist)
+- API: `http://127.0.0.1:8000` (also proxied through frontend on port 3000)
+- Legacy HTML dashboard: `http://127.0.0.1:8000/dashboard`
 - Mattermost: `http://localhost:8065` (login `user@example.com` / `Password123!`)
 
 For local testing, `MODEL_THRESHOLD=0.0`, so every request triggers an alert.

@@ -1,7 +1,7 @@
-**/.venv/
-**/venv/
+.venv/
 __pycache__/
-
-*.txt
-!requirements.txt
-
+.pytest_cache/
+*.pyc
+.runtime/
+**/venv/
+config.toml

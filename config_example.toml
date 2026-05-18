@@ -1,0 +1,14 @@
+[model]
+threshold = 0.75
+
+[storage]
+database_path = "data/dns_security.sqlite3"
+
+[mattermost]
+# Mattermost REST API settings. Create a bot token in Mattermost and put it here
+# or provide it through the MATTERMOST_TOKEN environment variable.
+base_url = "https://mattermost.example.com"
+token = ""
+channel_id = ""
+enabled = false
+

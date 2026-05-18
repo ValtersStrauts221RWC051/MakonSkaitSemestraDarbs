@@ -99,6 +99,33 @@ def random_score(_: AnalysisIn) -> float:
     return round(random.random(), 4)
 
 
+def _extract_query_name(request: str) -> str:
+    parts = request.split(" ", 1)
+    return parts[1].strip() if len(parts) > 1 else parts[0].strip()
+
+
+def make_onnx_scorer(model_path: str) -> Callable[[AnalysisIn], float]:
+    import numpy as np
+    import onnxruntime as ort
+
+    from inference_onnx import extract_features
+
+    sess = ort.InferenceSession(model_path, providers=["CPUExecutionProvider"])
+    in_name = sess.get_inputs()[0].name
+    out_name = sess.get_outputs()[0].name
+
+    def score(data: AnalysisIn) -> float:
+        name = _extract_query_name(data.request)
+        if not name:
+            return 0.0
+        features = extract_features(name)
+        batch = np.expand_dims(features, axis=0)
+        probs = sess.run([out_name], {in_name: batch})[0]
+        return float(probs.flatten()[0])
+
+    return score
+
+
 def send_mattermost(config: Config, data: AnalysisIn, score: float) -> bool:
     if not config.mattermost_enabled:
         return False
@@ -129,11 +156,25 @@ def send_mattermost(config: Config, data: AnalysisIn, score: float) -> bool:
 def create_app(
     config: Config | None = None,
     store: Store | None = None,
-    model: Callable[[AnalysisIn], float] = random_score,
+    model: Callable[[AnalysisIn], float] | None = None,
     notify: Callable[[Config, AnalysisIn, float], bool] = send_mattermost,
 ) -> FastAPI:
     config = config or load_config()
     store = store or Store()
+    if model is None:
+        model_path = os.getenv("MODEL_PATH", "model.onnx")
+        if Path(model_path).exists():
+            try:
+                model = make_onnx_scorer(model_path)
+            except Exception as exc:
+                import logging
+                logging.getLogger(__name__).warning(
+                    "ONNX model %s could not be loaded, falling back to random_score: %s",
+                    model_path, exc,
+                )
+                model = random_score
+        else:
+            model = random_score
     app = FastAPI(title="DNS Security Analysis")
 
     @app.get("/health")

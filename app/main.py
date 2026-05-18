@@ -16,6 +16,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import case, func
+import logging
 
 from app.database import Base, make_engine, make_session_factory
 from app.features import FEATURE_NAMES, compute_features, parent_domain, subdomain_depth
